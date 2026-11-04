@@ -14,6 +14,7 @@
 
 import hashlib
 from collections import defaultdict
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
@@ -56,7 +57,9 @@ def _find_duplicate_initializers(
 
 
 def _create_name_sharing_dict(  # noqa: D417
-    duplicate_weights: defaultdict[tuple[int, str, tuple], set[tuple[str, int]]], suffix: str = ""
+    duplicate_weights: defaultdict[tuple[int, str, tuple], set[tuple[str, int]]],
+    suffix: str = "",
+    reserved_names: Optional[set[str]] = None,
 ) -> dict[tuple[str, int], str]:
     """Creates a map mapping old initializer names to new initializer names. As different ONNX models
     may use the same initializer name but need to be mapped to a different new name, the map is actually from
@@ -73,9 +76,13 @@ def _create_name_sharing_dict(  # noqa: D417
         duplicate_weights (`DefaultDict[Tuple[int, bytes]`):
 
         suffix (`str`, defaults to `""`):
+
+        reserved_names (`Optional[set[str]]`, defaults to `None`):
+            Existing tensor names that generated names must not shadow when a suffix is used.
     """
     name_sharing_dict = {}
     used_common_names = {}
+    reserved_names = set(reserved_names or ())
     for duplicates in duplicate_weights.values():
         common_name, model_id = duplicates.pop()
 
@@ -87,22 +94,46 @@ def _create_name_sharing_dict(  # noqa: D417
             used_common_names[common_name] = 0
 
         duplicates.add((common_name, model_id))
+        shared_name = f"{common_name}_{suffix}_{used_common_names[common_name]}" if suffix != "" else common_name
+        if suffix != "":
+            while shared_name in reserved_names:
+                used_common_names[common_name] += 1
+                shared_name = f"{common_name}_{suffix}_{used_common_names[common_name]}"
+            reserved_names.add(shared_name)
         for k in duplicates:
             assert k not in name_sharing_dict
-            name_sharing_dict[k] = (
-                f"{common_name}_{suffix}_{used_common_names[common_name]}" if suffix != "" else f"{common_name}"
-            )
+            name_sharing_dict[k] = shared_name
 
     return name_sharing_dict
 
 
+def _iter_graphs(graph: onnx.GraphProto) -> Iterator[onnx.GraphProto]:
+    """Yield a graph and its nested attribute graphs."""
+    yield graph
+    for node in graph.node:
+        for attribute in node.attribute:
+            if attribute.type == onnx.AttributeProto.GRAPH:
+                yield from _iter_graphs(attribute.g)
+            elif attribute.type == onnx.AttributeProto.GRAPHS:
+                for subgraph in attribute.graphs:
+                    yield from _iter_graphs(subgraph)
+
+
 def _replace_input_names(models: list[onnx.ModelProto], name_sharing_dict: dict[tuple[str, int], str]):
-    """Replaces the names of node inputs from the models by the names in the name_sharing_dict."""
-    for i in range(len(models)):
-        for node in models[i].graph.node:
-            for j in range(len(node.input)):
-                if (node.input[j], i) in name_sharing_dict:
-                    node.input[j] = name_sharing_dict[(node.input[j], i)]
+    """Replace initializer uses, including captures in nested graphs.
+
+    ONNX forbids subgraphs from shadowing names visible in an enclosing scope.
+    Graph inputs and outputs keep their public names; value_info only annotates uses.
+    """
+    for i, model in enumerate(models):
+        for graph in _iter_graphs(model.graph):
+            for node in graph.node:
+                for j, name in enumerate(node.input):
+                    if (name, i) in name_sharing_dict:
+                        node.input[j] = name_sharing_dict[(name, i)]
+            for value_info in graph.value_info:
+                if (value_info.name, i) in name_sharing_dict:
+                    value_info.name = name_sharing_dict[(value_info.name, i)]
 
 
 def _remove_redundant_initializers(models: list[onnx.ModelProto], name_sharing_dict: dict[tuple[str, int], str]):
@@ -256,7 +287,18 @@ def _get_onnx_opset(model: onnx.ModelProto):
 def _deduplicated_cross_model_initializers(models: list[onnx.ModelProto], suffix: Optional[str] = None):
     """TODO: short documentation."""
     duplicates = _find_duplicate_initializers(models)
-    name_sharing_dict = _create_name_sharing_dict(duplicates, suffix=suffix)
+    # Lifted initializers are visible in every branch. Their new names must not
+    # collide with existing values, including independent sibling-local values.
+    reserved_names = set()
+    for model in models:
+        for graph in _iter_graphs(model.graph):
+            reserved_names.update(value.name for value in (*graph.input, *graph.output, *graph.value_info))
+            reserved_names.update(initializer.name for initializer in graph.initializer)
+            reserved_names.update(initializer.values.name for initializer in graph.sparse_initializer)
+            for node in graph.node:
+                reserved_names.update(node.input)
+                reserved_names.update(node.output)
+    name_sharing_dict = _create_name_sharing_dict(duplicates, suffix=suffix, reserved_names=reserved_names)
 
     _replace_input_names(models, name_sharing_dict)
 
