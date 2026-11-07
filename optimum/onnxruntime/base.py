@@ -436,7 +436,8 @@ class ORTSessionMixin:
                 output_shape = self._output_shape_inference(output_name, known_axes_values)
 
             if output_name in known_output_buffers:
-                output_buffer = known_output_buffers[output_name]
+                # ONNX Runtime writes dense output data without considering PyTorch strides.
+                output_buffer = known_output_buffers[output_name].contiguous()
             else:
                 output_buffer = self._prepare_output_buffer(output_name, output_shape)
 
