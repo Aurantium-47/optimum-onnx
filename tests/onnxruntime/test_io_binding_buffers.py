@@ -77,3 +77,60 @@ def test_reused_output_buffer_preserves_logical_tensor_order(tmp_path, layout, r
     else:
         assert buffers["out_sample"].data_ptr() != sample.data_ptr()
         torch.testing.assert_close(sample, original)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("use_io_binding", [False, True])
+@pytest.mark.parametrize("reuse_buffer", [False, True])
+def test_unet_output_buffer_matches_declared_dtype(tmp_path, dtype, transposed, use_io_binding, reuse_buffer):
+    pytest.importorskip("diffusers")
+    from optimum.onnxruntime.modeling_diffusion import ORTUnet
+
+    ort.disable_telemetry_events()
+    backing = torch.full((20,), -99.0, dtype=dtype)
+    sample = backing[4:16].reshape(1, 1, 3, 4)
+    sample.copy_(torch.arange(12).reshape(sample.shape))
+    if transposed:
+        sample = sample.transpose(-1, -2)
+    original = sample.clone()
+    guards = backing.clone()
+    expected = original.to(torch.float16) + 1
+    # The graph only writes float16, so even the failing float32 case has enough storage.
+    graph = helper.make_graph(
+        [helper.make_node("Add", ["sample", "one"], ["out_sample"])],
+        "unet_reused_output_buffer",
+        [
+            helper.make_tensor_value_info("sample", TensorProto.FLOAT16, list(sample.shape)),
+            helper.make_tensor_value_info("timestep", TensorProto.FLOAT16, []),
+            helper.make_tensor_value_info("encoder_hidden_states", TensorProto.FLOAT16, [1, 2, 3]),
+        ],
+        [helper.make_tensor_value_info("out_sample", TensorProto.FLOAT16, list(sample.shape))],
+        [helper.make_tensor("one", TensorProto.FLOAT16, [], [1.0])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=9)
+    onnx.checker.check_model(model)
+    path = tmp_path / "model.onnx"
+    onnx.save(model, path)
+    (tmp_path / "config.json").write_text('{"time_cond_proj_dim": null}')
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    session = ort.InferenceSession(str(path), sess_options=options, providers=["CPUExecutionProvider"])
+    # Forward only uses the parent's class name to decide whether to reuse the sample.
+    parent_name = "StableDiffusionPipeline" if reuse_buffer else "LatentConsistencyModelPipeline"
+    parent = type(parent_name, (), {})()
+    unet = ORTUnet(session, parent, use_io_binding=use_io_binding)
+    actual = unet.forward(sample, torch.tensor(1.0, dtype=dtype), torch.ones(1, 2, 3, dtype=dtype)).sample
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.dtype == torch.float16
+    assert actual.device == sample.device
+    assert actual.is_contiguous()
+    torch.testing.assert_close(backing[:4], guards[:4])
+    torch.testing.assert_close(backing[16:], guards[16:])
+    if use_io_binding and reuse_buffer and dtype == torch.float16 and not transposed:
+        assert actual.data_ptr() == sample.data_ptr()
+    else:
+        assert actual.data_ptr() != sample.data_ptr()
+        torch.testing.assert_close(sample, original)
